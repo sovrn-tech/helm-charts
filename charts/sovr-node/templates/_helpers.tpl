@@ -175,8 +175,14 @@ ConfigMap scripts stay generic.
   value: {{ .Values.validator.externalAddress | quote }}
 {{- if $goMem }}
   {{/* Go soft memory limit so it GCs before the cgroup OOM-kills the pod.
-       ~75% of resources.limits.memory, or config.goMemLimit if set. */}}
+       ~75% of resources.limits.memory, or config.goMemLimit if set. The chart
+       always sets this (when a limit is derivable) so the image's conservative
+       baked-in GOMEMLIMIT default can't leak through and thrash the GC. */}}
 - name: GOMEMLIMIT
   value: {{ $goMem | quote }}
 {{- end }}
+  {{/* Own GOGC too, so the image's aggressive baked-in default (tuned for a
+       small node) can't apply. Higher GOGC = less-frequent GC = less CPU. */}}
+- name: GOGC
+  value: {{ .Values.config.goGC | quote }}
 {{- end -}}

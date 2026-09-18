@@ -2,7 +2,7 @@
 {{- $gcm := include "sovr-node.genesisConfigMap" . -}}
 {{- $net := fromJson (include "sovr-node.net" .) -}}
 {{- if and (eq .Values.mode "archive") (eq (len $net.bootstrap) 0) -}}
-{{- fail (printf "\n\nmode=archive is not available for network %q: its from-genesis bootstrap ladder (networks.%s.bootstrap) is empty.\nThe mainnet ladder is bundled; the testnet pre-x/upgrade bootstrap is not yet characterized.\nUse mode=default (state-sync) for %s, or define networks.%s.bootstrap (see mainnet-runbook/genesis-replay-ladder.md).\n" .Values.network .Values.network .Values.network .Values.network) -}}
+{{- fail (printf "\n\nmode=archive is not available for network %q: its from-genesis bootstrap ladder (networks.%s.bootstrap) is empty.\nThe mainnet ladder is bundled; the testnet pre-x/upgrade bootstrap is not yet characterized.\nUse mode=default (state-sync) for %s, or define networks.%s.bootstrap.\n" .Values.network .Values.network .Values.network .Values.network) -}}
 {{- end -}}
 {{- if and .Values.validator.enabled (not .Values.validator.privValidatorKeySecret) -}}
 {{- fail "\n\nvalidator.enabled=true requires validator.privValidatorKeySecret — a Secret holding your UNIQUE consensus key.\nWithout it the node would sign with a randomly generated key (not your validator). Create it with:\n  kubectl create secret generic <name> --from-file=priv_validator_key.json=./priv_validator_key.json\nthen set validator.privValidatorKeySecret=<name>. NEVER run this key on two nodes at once (double-sign = slash + tombstone).\n" -}}

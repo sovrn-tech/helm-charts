@@ -3,11 +3,6 @@
 Public Helm charts for the **SOVR chain** (`sovr-1` mainnet), published as OCI
 artifacts to `ghcr.io/sovrn-tech/charts`.
 
-> This repo is **generated**. The chart source is maintained in
-> [`parler-tech/sbn`](https://github.com/parler-tech/sbn) under `helm/sovr-node/`
-> and synced here automatically — please don't hand-edit `charts/sovr-node/` or
-> `.github/workflows/publish-chart.yml` (both are overwritten on the next sync).
-
 ## sovr-node
 
 A full node / RPC / validator for the SOVR chain, with signed-snapshot restore
@@ -52,16 +47,8 @@ spec:
 
 ### Becoming a validator
 
-The chart ships a `validator.enabled` overlay. See the full walkthrough
-(both this Helm method and a docker-compose method) in the sbn repo:
-`deploy/validator/become-a-validator.md`, and the chart's own
-`charts/sovr-node/README.md` for the validator values and secrets.
-
-## How releases work
-
-1. A maintainer bumps `version:` in `helm/sovr-node/Chart.yaml` in **sbn** and
-   merges to `master`.
-2. sbn's `helm-chart-sync` workflow mirrors the chart here (`charts/sovr-node/`),
-   refreshes `publish-chart.yml`, and pushes a matching `v<version>` tag.
-3. This repo's `publish-chart` workflow packages the chart, pushes it to
-   `ghcr.io/sovrn-tech/charts`, and cuts a GitHub Release with the `.tgz`.
+The chart ships a `validator.enabled` overlay. See the chart's own
+`charts/sovr-node/README.md` for the validator values and secrets, and the
+[`sovrn-tech/sovr-networks`](https://github.com/sovrn-tech/sovr-networks) repo
+(`deploy/validator/`) for the full "become a validator" walkthrough — both the
+Helm method and a docker-compose method.

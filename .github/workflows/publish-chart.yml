@@ -1,8 +1,5 @@
-# Copy this to  .github/workflows/publish-chart.yml  in sovrn-tech/helm-charts.
-#
-# On a `v<version>` tag (pushed by sbn's helm-chart-sync workflow when
-# helm/sovr-node/Chart.yaml is bumped), package the chart, push it as an OCI
-# artifact to ghcr.io/sovrn-tech/charts, and cut a GitHub Release with the .tgz.
+# On a `v<version>` tag, package the chart, push it as an OCI artifact to
+# ghcr.io/sovrn-tech/charts, and cut a GitHub Release with the .tgz.
 #
 # Consumers then:
 #   helm install sovr oci://ghcr.io/sovrn-tech/charts/sovr-node --version <version>

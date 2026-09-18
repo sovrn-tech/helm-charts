@@ -17,7 +17,7 @@ Pick a **network** and a **mode**:
 | `mode` | How it syncs | Time | Use for |
 |--------|--------------|------|---------|
 | `default` | **state-sync** from a recent snapshot | minutes | RPC / full nodes (the 95% case) |
-| `snapshot` | **download a signed archive snapshot** (spec 011) | minutes–<1h | archive / indexer nodes — self-serve from anywhere |
+| `snapshot` | **download a signed archive snapshot** | minutes–<1h | archive / indexer nodes — self-serve from anywhere |
 | `archive` | **from-genesis binary-ladder replay** | **~1–2 days** | archive nodes, trustless verification (**mainnet only**) |
 
 Genesis for each network is **bundled in the chart** and selected automatically —
@@ -254,9 +254,10 @@ kubectl -n sovr exec sts/my-val-sovr-node -c sovrd -- sovrd comet show-validator
 
 Do this only once step 4 shows `catching_up:false`. It is identical to the
 docker-compose method's staking steps — fund an operator account, then
-`sovrd tx staking create-validator …`. Those exact flags are still being
-dry-run-verified; treat them as a draft until confirmed (see the unified
-"Become a validator" doc / `deploy/validator/README.md` §6–§7).
+`sovrd tx staking create-validator …`. For the full walkthrough (funding,
+`create-validator`, operating, and unjailing), see the "become a validator"
+guide in [`sovrn-tech/sovr-networks`](https://github.com/sovrn-tech/sovr-networks)
+(`deploy/validator/`).
 
 ### 6. Operate
 
@@ -398,21 +399,17 @@ spec:
       size: 400Gi
 ```
 
-## Publishing (→ public `sovrn-tech/helm-charts`)
+## Install
 
-This chart is published from the public **`sovrn-tech/helm-charts`** repo and has
-**no dependency on anything private** — images are the public
-`ghcr.io/sovrn-tech/sovrd` tags and genesis is bundled. It ships as an **OCI
-chart** alongside the images:
+The chart ships as an **OCI artifact** — no `helm repo add` needed:
 
 ```sh
-helm package helm/sovr-node
-helm push sovr-node-<ver>.tgz oci://ghcr.io/sovrn-tech/charts
-# consume: helm install sovr oci://ghcr.io/sovrn-tech/charts/sovr-node --version <ver>
+helm install sovr oci://ghcr.io/sovrn-tech/charts/sovr-node --version <ver>
 ```
 
-(A classic GitHub-Pages Helm repo with an `index.yaml` also works; OCI under
-`ghcr.io/sovrn-tech` matches how the node images are already distributed.)
+Images are the public `ghcr.io/sovrn-tech/sovrd` tags and genesis is bundled in
+the chart, so there is nothing else to fetch. For a GitOps setup, point a Flux
+`OCIRepository` at `oci://ghcr.io/sovrn-tech/charts` (see the GitOps note above).
 
 ## Values
 
@@ -420,45 +417,36 @@ See [`values.yaml`](./values.yaml) — every field is commented. Most-used:
 `network`, `mode`, `image.tag`, `persistence.*`, `stateSync.*`, `resources`,
 `service.*`, and the `networks.<network>.*` presets.
 
-## Cluster-validation status
+## Before you run it on your cluster
 
-**`mode=default` (state-sync) is cluster-validated** on RKE2 + rancher `local-path`
-(mainnet): the uid/gid volume-permission fix, cosmovisor `v1.7.0` download + start,
-`sovrd init`, the section-scoped `config.toml`/`app.toml` `sed` patches, and the
-state-sync trust-anchor auto-fetch all work end to end — the node reached head. On
-your own cluster still confirm:
+All three modes (`default` state-sync, `snapshot`, and the `validator.enabled`
+overlay) are exercised on mainnet across amd64 and arm64 nodes. A few things
+depend on your cluster — confirm them:
 
-1. **cosmovisor version pin** suits your policy — pin `cosmovisor.sha256` for
-   reproducibility (the `v1.7.0` linux/amd64 asset URL is confirmed to resolve).
-2. **PodSecurity admission** allows the pod's uid/gid 1000.
+1. **PodSecurity admission** allows the pod's uid/gid 1000, plus the
+   `restore-snapshot` init container's `runAsUser: 0` (snapshot mode only).
+2. **cosmovisor version pin** suits your policy — pin `cosmovisor.sha256` for
+   reproducibility.
+3. **Cross-arch reschedule.** Staged binaries match the node arch they were
+   staged on, so pin the pod to one arch (`nodeSelector.kubernetes.io/arch`) if
+   your cluster is mixed amd64/arm64.
+4. **Validator key.** In `validator.enabled` mode, confirm the node signs with
+   YOUR key: `sovrd comet show-validator` must match the Secret you supplied
+   (see "Running a validator").
 
-**`mode=snapshot` + `validator.enabled` are cluster-validated** (mainnet, on a
-mixed amd64/arm64 cluster with Longhorn): snapshot restore (cosign-verify →
-2-anchor cross-check → sha256 → extract), the Secret-mounted consensus key
-(confirmed the node's `sovrd comet show-validator` matches the Secret, not a
-generated key), the `external_address` DNS advertisement, and the p2p
-LoadBalancer all work end to end — the node reached `catching_up:false`. Three
-bugs were found and fixed during that bring-up (all in current chart versions):
+**Memory — size it with headroom.** The chart owns the Go runtime memory knobs so
+the node image's conservative baked-in defaults can't apply: it sets `GOMEMLIMIT`
+to ~75% of `resources.limits.memory` (override with `config.goMemLimit`) and
+`GOGC` (`config.goGC`, default 100). `GOMEMLIMIT` makes Go GC before the cgroup
+OOM-kills the pod — an OOM on mainnet's tight downtime window jails + slashes you.
 
-- **arch-specific downloads.** `cosign` and `cosmovisor` were fetched as
-  `linux-amd64` unconditionally; on an arm64 node they couldn't exec (cosign
-  surfaced as a bogus "signature invalid"). Both now follow the node arch.
-- **snapshot + cosmovisor.** A published snapshot's `data/upgrade-info.json`
-  (the producer's last applied upgrade) made cosmovisor try to swap to an
-  unstaged `upgrades/<name>` binary and back up the whole data dir. The restore
-  now strips that vestigial file (the current binary already includes the
-  upgrade). `mode=default` never carries the file.
-
-Still confirm on your own cluster: the pod is stable across a **cross-arch
-reschedule** only if pinned (`nodeSelector.kubernetes.io/arch`) — staged binaries
-match the node they were staged on; and PodSecurity admission allows uid/gid 1000
-plus the `restore-snapshot` init's `runAsUser: 0`.
-
-**Memory / OOM.** The chart sets `GOMEMLIMIT` to ~75% of `resources.limits.memory`
-(override with `config.goMemLimit`) so Go GCs before the cgroup OOM-kills the pod
-— an OOM on mainnet's tight downtime window jails + slashes you. So **set
-`resources.limits.memory` realistically for the node** it runs on (the default
-`16Gi` assumes a large node); don't set a limit the node can't honor.
+But **don't set the limit too tight, either.** If `GOMEMLIMIT` lands right at the
+live heap, Go GCs *continuously* — a "GC death-spiral" that pins CPU at several
+cores with no OOM and no missed blocks (so nothing alerts). A full-history or
+validator node's IAVL working set is ~1.7Gi, so **keep `resources.limits.memory`
+≥ 4Gi** (⇒ `GOMEMLIMIT` ~3Gi, ~1.4Gi of headroom). The default `16Gi` assumes a
+large node; if you trim it, trim to **≥4Gi**, not 2Gi. Don't set a limit the node
+can't honor.
 
 **`mode=archive` (from-genesis) has NOT been run end to end inside the chart.** The
 `--halt-height` ladder itself is **proven outside the chart** — a full genesis→head

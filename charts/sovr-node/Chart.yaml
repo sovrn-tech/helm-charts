@@ -7,7 +7,7 @@ description: >-
   runs it as a signing validator with an operator-supplied consensus key. All
   converge on cosmovisor, which drives every future x/upgrade.
 type: application
-version: 0.2.0
+version: 0.2.1
 # The current chain binary this chart ships as the running / state-sync image.
 appVersion: "v0.27.1"
 keywords:
