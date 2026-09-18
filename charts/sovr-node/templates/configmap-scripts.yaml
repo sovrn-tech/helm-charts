@@ -1,0 +1,280 @@
+{{- $net := fromJson (include "sovr-node.net" .) -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sovr-node.fullname" . }}-scripts
+  labels:
+    {{- include "sovr-node.labels" . | nindent 4 }}
+data:
+  # Per-binary wrapper: cosmovisor execs cosmovisor/<slot>/bin/sovrd (this), which
+  # points LD_LIBRARY_PATH at that slot's OWN libwasmvm before exec'ing the real
+  # binary. This is what lets one cosmovisor mix binaries needing different
+  # libwasmvm versions that share the same soname.
+  wrapper.sh: |
+    #!/bin/sh
+    d=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    export LD_LIBRARY_PATH="$d/../lib:${LD_LIBRARY_PATH:-}"
+    exec "$d/sovrd.real" "$@"
+
+  # initContainer 1 (curl image): download cosmovisor + optional genesis-by-url +
+  # optional statesync trust anchor. Idempotent.
+  fetch.sh: |
+    #!/bin/sh
+    set -eu
+    # Group-writable (umask 0002) so every container in the fsGroup (supplemental
+    # gid) can write each other's dirs — the sovrd init container writes into the
+    # config/ dir this curl container creates. chmod fixes it on a restart too.
+    umask 0002
+    H="$HOME_DIR"
+    mkdir -p "$H/runtime" "$H/config"
+    chmod g+rwx "$H" "$H/runtime" "$H/config" 2>/dev/null || true
+    if [ ! -x "$H/runtime/cosmovisor" ]; then
+      # cosmovisor.downloadUrl defaults to the linux-amd64 asset; on arm64 swap
+      # the arch token so the binary matches the node (custom URLs pass through).
+      CVURL="$COSMOVISOR_URL"
+      case "$(uname -m)" in
+        aarch64 | arm64) CVURL=$(printf '%s' "$CVURL" | sed 's/linux-amd64/linux-arm64/') ;;
+      esac
+      echo "[fetch] cosmovisor <- $CVURL"
+      curl -fsSL "$CVURL" -o /tmp/cv.tgz
+      if [ -n "$COSMOVISOR_SHA256" ]; then echo "$COSMOVISOR_SHA256  /tmp/cv.tgz" | sha256sum -c -; fi
+      tar -xzf /tmp/cv.tgz -C "$H/runtime" cosmovisor 2>/dev/null || tar -xzf /tmp/cv.tgz -C "$H/runtime"
+      chmod +x "$H/runtime/cosmovisor"
+    fi
+    if [ -n "$GENESIS_URL" ] && [ ! -f "$H/config/genesis.json" ] && [ ! -f "$H/config/genesis.json.src" ]; then
+      echo "[fetch] genesis <- $GENESIS_URL"
+      curl -fsSL "$GENESIS_URL" -o "$H/config/genesis.json.src"
+      if [ -n "$GENESIS_SHA256" ]; then echo "$GENESIS_SHA256  $H/config/genesis.json.src" | sha256sum -c -; fi
+    fi
+    if [ "$MODE" = "default" ] && [ "$STATESYNC_AUTOFETCH" = "true" ] && [ -z "$TRUST_HASH" ] && [ ! -f "$H/config/.statesync.env" ]; then
+      RPC1=$(printf '%s' "$STATESYNC_RPCSERVERS" | cut -d, -f1)
+      echo "[fetch] statesync trust anchor <- $RPC1"
+      LATEST=$(curl -fsSL "$RPC1/block" 2>/dev/null | grep -oE '"height":"[0-9]+"' | head -1 | grep -oE '[0-9]+' || true)
+      if [ -n "$LATEST" ]; then
+        TH=$((LATEST - STATESYNC_OFFSET)); [ "$TH" -lt 1 ] && TH=1
+        HH=$(curl -fsSL "$RPC1/block?height=$TH" 2>/dev/null | grep -oE '"hash":"[A-F0-9]+"' | head -1 | sed -E 's/.*"hash":"([A-F0-9]+)".*/\1/' || true)
+        if [ -n "$HH" ]; then
+          printf 'TRUST_HEIGHT=%s\nTRUST_HASH=%s\n' "$TH" "$HH" > "$H/config/.statesync.env"
+          echo "[fetch] trust_height=$TH trust_hash=$HH"
+        else echo "[fetch] WARN: could not derive trust_hash; set stateSync.trustHeight/Hash manually"; fi
+      else echo "[fetch] WARN: could not reach $RPC1 for a trust anchor"; fi
+    fi
+
+  # initContainer 2 (sovrd image): scaffold home + install genesis + patch config.
+  init-home.sh: |
+    #!/bin/sh
+    set -eu
+    umask 0002
+    H="$HOME_DIR"; CFG="$H/config/config.toml"; APP="$H/config/app.toml"
+    mkdir -p "$H/config" "$H/data"
+    if [ ! -f "$CFG" ]; then
+      echo "[init] sovrd init $MONIKER ($CHAIN_ID)"
+      sovrd init "$MONIKER" --chain-id "$CHAIN_ID" --home "$H" >/dev/null 2>&1 || \
+        sovrd init "$MONIKER" --chain-id "$CHAIN_ID" --home "$H"
+    fi
+    if [ -f /genesis/genesis.json ]; then cp /genesis/genesis.json "$H/config/genesis.json";
+    elif [ -f "$H/config/genesis.json.src" ]; then cp "$H/config/genesis.json.src" "$H/config/genesis.json";
+    elif [ ! -s "$H/config/genesis.json" ]; then
+      echo "[init] ERROR: no genesis (set genesis.configMap or genesis.url)"; exit 1; fi
+    sed -i 's|^moniker *=.*|moniker = "'"$MONIKER"'"|' "$CFG"
+    sed -i 's|^laddr = "tcp://127.0.0.1:26657"|laddr = "tcp://0.0.0.0:26657"|' "$CFG"
+    sed -i 's|^minimum-gas-prices *=.*|minimum-gas-prices = "'"$MIN_GAS_PRICES"'"|' "$APP"
+    sed -i 's|^pruning *=.*|pruning = "'"$PRUNING"'"|' "$APP"
+    sed -i '/^\[api\]/,/^\[/ s|^enable *=.*|enable = true|' "$APP"
+    sed -i '/^\[api\]/,/^\[/ s|^address *=.*|address = "tcp://0.0.0.0:1317"|' "$APP"
+    sed -i '/^\[grpc\]/,/^\[/ s|^address *=.*|address = "0.0.0.0:9090"|' "$APP"
+    if [ "$MODE" = "archive" ]; then
+      sed -i '/^\[p2p\]/,/^\[/ s|^pex *=.*|pex = false|' "$CFG"
+      sed -i '/^\[p2p\]/,/^\[/ s|^addr_book_strict *=.*|addr_book_strict = false|' "$CFG"
+      sed -i '/^\[p2p\]/,/^\[/ s|^persistent_peers *=.*|persistent_peers = "'"$ARCHIVE_PEER"'"|' "$CFG"
+      rm -f "$H/config/addrbook.json"
+      sed -i '/^\[statesync\]/,/^\[/ s|^enable *=.*|enable = false|' "$CFG"
+    elif [ "$MODE" = "snapshot" ]; then
+      # data is restored from a published snapshot (by the restore-snapshot init);
+      # disable statesync and blocksync the small gap to head via normal peers.
+      sed -i '/^\[statesync\]/,/^\[/ s|^enable *=.*|enable = false|' "$CFG"
+      if [ -n "$SEEDS" ]; then
+        sed -i '/^\[p2p\]/,/^\[/ s|^seeds *=.*|seeds = "'"$SEEDS"'"|' "$CFG"
+      fi
+      if [ -n "$PERSISTENT_PEERS" ]; then
+        sed -i '/^\[p2p\]/,/^\[/ s|^persistent_peers *=.*|persistent_peers = "'"$PERSISTENT_PEERS"'"|' "$CFG"
+      fi
+    else
+      TH="$TRUST_HEIGHT"; HH="$TRUST_HASH"
+      if [ -f "$H/config/.statesync.env" ]; then . "$H/config/.statesync.env"; TH="${TRUST_HEIGHT:-$TH}"; HH="${TRUST_HASH:-$HH}"; fi
+      sed -i '/^\[statesync\]/,/^\[/ s|^enable *=.*|enable = true|' "$CFG"
+      sed -i '/^\[statesync\]/,/^\[/ s|^rpc_servers *=.*|rpc_servers = "'"$STATESYNC_RPCSERVERS"'"|' "$CFG"
+      sed -i '/^\[statesync\]/,/^\[/ s|^trust_height *=.*|trust_height = '"${TH:-0}"'|' "$CFG"
+      sed -i '/^\[statesync\]/,/^\[/ s|^trust_hash *=.*|trust_hash = "'"${HH:-}"'"|' "$CFG"
+      if [ -n "$SEEDS" ]; then
+        sed -i '/^\[p2p\]/,/^\[/ s|^seeds *=.*|seeds = "'"$SEEDS"'"|' "$CFG"
+      fi
+      if [ -n "$PERSISTENT_PEERS" ]; then
+        sed -i '/^\[p2p\]/,/^\[/ s|^persistent_peers *=.*|persistent_peers = "'"$PERSISTENT_PEERS"'"|' "$CFG"
+      fi
+    fi
+    # Validator: advertise the dialable P2P address so peers can reach the signer.
+    if [ -n "${EXTERNAL_ADDRESS:-}" ]; then
+      sed -i '/^\[p2p\]/,/^\[/ s|^external_address *=.*|external_address = "'"$EXTERNAL_ADDRESS"'"|' "$CFG"
+      echo "[init] external_address = $EXTERNAL_ADDRESS"
+    fi
+    echo "[init] config patched (mode=$MODE)"
+
+  # initContainer 3..N (one per version image): stage sovrd + its libwasmvm + wrapper.
+  stage.sh: |
+    #!/bin/sh
+    set -eu
+    umask 0002
+    S="$HOME_DIR/cosmovisor/$SLOT"
+    if [ -x "$S/bin/sovrd.real" ]; then echo "[stage] $SLOT already staged"; exit 0; fi
+    mkdir -p "$S/bin" "$S/lib"
+    cp /usr/local/bin/sovrd "$S/bin/sovrd.real"
+    cp "$WASMVM_SRCDIR/$WASMVM_SONAME" "$S/lib/$WASMVM_SONAME"
+    cp /scripts/wrapper.sh "$S/bin/sovrd"
+    chmod +x "$S/bin/sovrd" "$S/bin/sovrd.real"
+    echo "[stage] $SLOT staged"
+
+  # archive-mode bootstrap: drive the from-genesis ladder with --halt-height at
+  # EVERY boundary (self-halt is unreliable — v0.16.2 forks v0.20.0-combined@
+  # 1210440), swapping binaries by hand. `--halt-height H` commits H-1; the next
+  # binary executes H. The current binary (v0.23.0 = cosmovisor genesis bin, run
+  # by run.sh AFTER this completes) applies v0.23.0-combined@1356994 and runs to
+  # tip. Idempotent + resumable via a progress marker (last completed boundary),
+  # so an interrupted run resumes the in-flight range and completed stages are
+  # skipped — old binaries never re-run against the v0.23.0-migrated state.
+  bootstrap.sh: |
+    #!/bin/sh
+    set -u
+    H="$HOME_DIR"
+    if [ -f "$H/.bootstrap-complete" ]; then
+      echo "[bootstrap] already complete — cosmovisor (v0.23.0) takes over"; exit 0
+    fi
+    prog=0; [ -f "$H/.bootstrap-progress" ] && prog=$(cat "$H/.bootstrap-progress" 2>/dev/null || echo 0)
+    run_stage() { # $1=slot  $2=haltHeight
+      slot="$1"; hh="$2"
+      if [ "$hh" -le "$prog" ]; then echo "[bootstrap] skip $slot (halt $hh <= progress $prog)"; return 0; fi
+      echo "[bootstrap] $slot start --halt-height $hh"
+      # log to the data PVC, not /tmp — a large segment's output can be tens of MB
+      log="$H/.bootstrap-stage.log"
+      "$H/cosmovisor/$slot/bin/sovrd" start --home "$H" --halt-height "$hh" >"$log" 2>&1 || true
+      if grep -q "halt per configuration height $hh" "$log"; then
+        prog="$hh"; printf '%s' "$prog" > "$H/.bootstrap-progress"
+        echo "[bootstrap]   clean halt at $hh"; rm -f "$log"
+      else
+        echo "[bootstrap] ERROR: $slot did not halt cleanly at $hh (resume on restart). tail:"
+        tail -8 "$log" 2>/dev/null; rm -f "$log"; exit 1
+      fi
+    }
+    {{- range $net.bootstrap }}
+    run_stage "{{ .slot }}" {{ int64 .haltHeight }}
+    {{- end }}
+    touch "$H/.bootstrap-complete"
+    echo "[bootstrap] complete (last boundary $prog) — cosmovisor (v0.23.0) applies v0.23.0-combined@1356994, runs to tip"
+
+  # snapshot-mode restore (runs in a curl+TLS init container as root so it can
+  # install jq/zstd + fetch cosign; the sovrd image's curl has no CA bundle). All
+  # gates fail closed: cosign-verify the signed manifest, cross-check its block_hash
+  # against TWO independent anchors, sha256-verify, then extract data/. Skipped once
+  # .snapshot-restored exists. Extracted data is chown'd to the node uid (1000).
+  restore-snapshot.sh: |
+    #!/bin/sh
+    set -eu
+    H="$HOME_DIR"
+    if [ -f "$H/.snapshot-restored" ]; then echo "[snapshot] already restored — skipping"; exit 0; fi
+    [ -n "$SNAPSHOT_BASEURL" ] || { echo "[snapshot] ERROR: snapshot.baseUrl unset"; exit 1; }
+    base="$SNAPSHOT_BASEURL/$NETWORK/archive"
+    W="$H/.snapshot-work"; rm -rf "$W"; mkdir -p "$W" "$H/data"; cd "$W"
+    if ! command -v jq >/dev/null || ! command -v unzstd >/dev/null; then
+      apk add --no-cache jq zstd >/dev/null 2>&1 || { echo "[snapshot] ERROR: apk add jq zstd failed"; exit 1; }
+    fi
+    if command -v cosign >/dev/null 2>&1; then COSIGN=cosign; else
+      case "$(uname -m)" in
+        x86_64) CARCH=amd64 ;;
+        aarch64 | arm64) CARCH=arm64 ;;
+        *) echo "[snapshot] ERROR: unsupported arch $(uname -m) for cosign download"; exit 1 ;;
+      esac
+      curl -fsSL "https://github.com/sigstore/cosign/releases/download/${SNAPSHOT_COSIGN_VERSION}/cosign-linux-${CARCH}" -o /tmp/cosign
+      chmod +x /tmp/cosign; COSIGN=/tmp/cosign
+    fi
+    echo "[snapshot] resolving $base/latest.json"
+    curl -fsSL "$base/latest.json" -o latest.json
+    curl -fsSL "$base/latest.json.sig" -o latest.json.sig
+    # 1. authenticity (fail-closed)
+    if [ -n "$SNAPSHOT_COSIGN_PUBKEY" ]; then
+      printf '%s' "$SNAPSHOT_COSIGN_PUBKEY" > cosign.pub
+      "$COSIGN" verify-blob --key cosign.pub --signature latest.json.sig latest.json >/dev/null 2>&1 \
+        || { echo "[snapshot] FAIL-CLOSED: manifest signature invalid (keyed)"; exit 4; }
+    else
+      [ -n "$SNAPSHOT_COSIGN_IDENTITY" ] && [ -n "$SNAPSHOT_COSIGN_ISSUER" ] \
+        || { echo "[snapshot] ERROR: set snapshot.cosignPublicKey OR (cosignIdentity + cosignIssuer)"; exit 1; }
+      "$COSIGN" verify-blob --certificate-identity "$SNAPSHOT_COSIGN_IDENTITY" \
+        --certificate-oidc-issuer "$SNAPSHOT_COSIGN_ISSUER" --signature latest.json.sig latest.json >/dev/null 2>&1 \
+        || { echo "[snapshot] FAIL-CLOSED: manifest signature invalid (keyless)"; exit 4; }
+    fi
+    echo "[snapshot] signature OK"
+    file=$(jq -r .file latest.json); want=$(jq -r .sha256 latest.json)
+    height=$(jq -r .height latest.json); bhash=$(jq -r .block_hash latest.json); cid=$(jq -r .chain_id latest.json)
+    [ "$cid" = "$CHAIN_ID" ] || { echo "[snapshot] FAIL-CLOSED: snapshot chain_id $cid != $CHAIN_ID"; exit 4; }
+    # 2. canonical cross-check: signed manifest block_hash vs TWO independent
+    # anchors. This anchors the *claimed* height to the real chain — it does not
+    # re-derive a hash from the extracted data (the node isn't running yet). The
+    # extracted bytes are guaranteed instead by step 3 (sha256 over the tarball,
+    # signed in the manifest) + the unzstd-failure guard in step 4; a post-start
+    # consensus re-check of the restored data is verify-archive-snapshot.sh
+    # `crosscheck` against the live node (docs/node-operations.md §5).
+    A=$(printf '%s' "$SNAPSHOT_ANCHORS" | cut -d, -f1); B=$(printf '%s' "$SNAPSHOT_ANCHORS" | cut -d, -f2)
+    { [ -n "$A" ] && [ -n "$B" ] && [ "$A" != "$B" ]; } || {
+      echo "[snapshot] FAIL-CLOSED: mode=snapshot needs TWO distinct RPC anchors in"
+      echo "  snapshot.crosscheckAnchors (a list of >=2). The chart pre-fills rpc + rpc2;"
+      echo "  if you overrode them, provide two distinct endpoints."
+      exit 4; }
+    ha=$(curl -fsSL "$A/block?height=$height" | jq -r '.result.block_id.hash')
+    hb=$(curl -fsSL "$B/block?height=$height" | jq -r '.result.block_id.hash')
+    if [ "$bhash" != "$ha" ] || [ "$bhash" != "$hb" ]; then
+      echo "[snapshot] FAIL-CLOSED: block $height disagreement (manifest=$bhash A=$ha B=$hb)"; exit 4
+    fi
+    echo "[snapshot] cross-check OK: manifest + both anchors agree on block $height"
+    # 3. download + integrity (fail-closed)
+    echo "[snapshot] downloading $file"; curl -fsSL "$base/$file" -o "$file"
+    got=$(sha256sum "$file" | awk '{print $1}')
+    [ "$got" = "$want" ] || { echo "[snapshot] FAIL-CLOSED: checksum $got != $want"; exit 4; }
+    echo "[snapshot] checksum OK"
+    # 4. extract data/ (full history) into the node home.
+    # POSIX /bin/sh under `set -eu` has no pipefail, so `unzstd -c | tar` would
+    # report tar's status only: an OOM-killed / truncated unzstd mid-stream can
+    # leave tar exiting 0 on the partial input it did receive, marking the node
+    # restored on incomplete chain data. Capture unzstd's own rc across the pipe
+    # (subshell writes it to a file) and fail closed if it is non-zero.
+    case "$file" in
+      *.tar.zst)
+        rc="$W/.unzstd_rc"; rm -f "$rc"
+        { unzstd -c "$file" || echo "$?" > "$rc"; } | tar -C "$H" -xf -
+        if [ -s "$rc" ]; then
+          echo "[snapshot] FAIL-CLOSED: unzstd failed (rc=$(cat "$rc")) during extraction — partial/corrupt data"; exit 4
+        fi
+        ;;
+      *.tar.gz)  tar -C "$H" -xzf "$file" ;;
+      *) echo "[snapshot] ERROR: unknown format $file"; exit 1 ;;
+    esac
+    [ -d "$H/data" ] || { echo "[snapshot] ERROR: extraction produced no data/"; exit 1; }
+    # A published snapshot's data/ carries the producer's last upgrade-info.json.
+    # That upgrade is already applied in the restored state, but cosmovisor would
+    # read it and try to swap to an upgrades/<name> binary that isn't staged
+    # (the current/genesis binary already includes it). Remove it so cosmovisor
+    # just runs the current binary. (mode=default state-sync never has this file.)
+    rm -f "$H/data/upgrade-info.json"
+    rm -rf "$W"; touch "$H/.snapshot-restored"
+    chown -R 1000:1000 "$H/data" "$H/.snapshot-restored" 2>/dev/null || true
+    echo "[snapshot] restored to height $height; node will blocksync the gap to head"
+
+  # main container entrypoint.
+  run.sh: |
+    #!/bin/sh
+    set -eu
+    export DAEMON_HOME="$HOME_DIR"
+    export DAEMON_NAME=sovrd
+    export DAEMON_RESTART_AFTER_UPGRADE=true
+    export DAEMON_ALLOW_DOWNLOAD_BINARIES=false
+    if [ "$MODE" = "archive" ]; then /scripts/bootstrap.sh; fi
+    echo "[run] starting cosmovisor (mode=$MODE)"
+    exec "$HOME_DIR/runtime/cosmovisor" run start --home "$HOME_DIR"

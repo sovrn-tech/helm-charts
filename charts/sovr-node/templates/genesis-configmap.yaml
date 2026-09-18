@@ -1,0 +1,20 @@
+{{- /*
+  Bundled canonical sovr-1 genesis (files/genesis.json), rendered into a
+  ConfigMap so the chart is fully self-contained — no manual download, no
+  pre-created resource. Rendered only when no external genesis is chosen
+  (genesis.configMap unset AND genesis.url unset). 33 KB, well under the
+  1 MB ConfigMap limit. If you point chainId at a different network, supply
+  that network's genesis via genesis.configMap or genesis.url instead.
+*/ -}}
+{{- $net := fromJson (include "sovr-node.net" .) -}}
+{{- if and (not .Values.genesis.configMap) (not .Values.genesis.url) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sovr-node.fullname" . }}-genesis
+  labels:
+    {{- include "sovr-node.labels" . | nindent 4 }}
+data:
+  genesis.json: |-
+{{ .Files.Get (printf "files/%s" $net.genesisFile) | indent 4 }}
+{{- end }}

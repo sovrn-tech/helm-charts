@@ -1,0 +1,295 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# sovr-node — a cosmovisor-managed SOVR chain node.
+#
+# Pick a NETWORK and a bring-up MODE. All modes run under cosmovisor, so once
+# synced they auto-halt + swap binary + resume at every FUTURE x/upgrade.
+#
+#   network: mainnet | testnet   -> selects genesis, chain-id, peers, rpc, ladder
+#   mode:    default | archive | snapshot
+#     default  -> state-sync from a recent snapshot (minutes). The 95% case.
+#     archive  -> replay the full binary ladder from genesis (~1-2 DAYS,
+#                 sequential/single-core-bound). Mainnet only (see networks.*.bootstrap).
+#     snapshot -> restore a signed, published archive snapshot, then blocksync
+#                 the small gap to head. Required to bootstrap a validator.
+#
+# To run a signing VALIDATOR, set `validator.enabled: true` (see the validator:
+# block below) on top of a bootstrap mode. On mainnet a validator MUST use
+# `mode: snapshot` — from-genesis single-binary sync is impossible.
+# ─────────────────────────────────────────────────────────────────────────────
+mode: default
+network: mainnet
+moniker: sovr-node
+
+# ── validator overlay ───────────────────────────────────────────────────────
+# OFF by default (a plain full node). Turn on to run a signing validator. This
+# does NOT stake — you fund an operator account and run `create-validator`
+# yourself once the node is synced. See README "Running a validator".
+#
+# ⚠️  SAFETY: a validator's consensus key must be UNIQUE and must NEVER sign from
+# two places at once (double-sign = ~5% slash + permanent tombstone). This chart
+# hardcodes replicas=1; you supply the key via a Secret (never generated here).
+validator:
+  enabled: false
+  # Name of a Secret holding your consensus key under data key
+  # `priv_validator_key.json`. REQUIRED when enabled. Create it with e.g.:
+  #   kubectl create secret generic my-val-key \
+  #     --from-file=priv_validator_key.json=./priv_validator_key.json
+  # The chart mounts it read-only over config/priv_validator_key.json, so the
+  # node signs with YOUR key, never the one `sovrd init` would generate. The key
+  # stays in the Secret (surfaced read-only); it is not copied onto the PVC.
+  privValidatorKeySecret: ""
+  # Optional: a Secret with `node_key.json` to pin your P2P node identity across
+  # re-inits (otherwise a random node_key is generated on the PVC).
+  nodeKeySecret: ""
+  # OPTIONAL. A validator stays connected via OUTBOUND dials to the seeds/
+  # persistent-peers (pre-filled per network), so inbound reachability is NOT
+  # required to validate — an outbound-only / NAT'd validator works and earns
+  # rewards. Set externalAddress + p2pService ONLY if you want peers to be able to
+  # dial you (public IP/DNS or the LB/NodePort in front of the node); it's written
+  # to config.toml `external_address`. Sentry-fronted validators leave both off
+  # and set persistentPeers to their sentries instead.
+  externalAddress: ""
+  # OPTIONAL external Service exposing ONLY p2p (RPC/gRPC/API stay ClusterIP-
+  # private). Off by default — enable only if you want inbound peers. If you front
+  # P2P yourself (own LB/ingress) or run outbound-only, leave it disabled.
+  p2pService:
+    enabled: false
+    type: LoadBalancer          # LoadBalancer | NodePort
+    nodePort: ""                # optional fixed nodePort when type=NodePort
+    annotations: {}
+    loadBalancerIP: ""
+  # PodDisruptionBudget so a routine node drain can't casually evict your single
+  # signer (an eviction = missed blocks). minAvailable:1 blocks voluntary
+  # eviction until you cordon/handle it deliberately.
+  podDisruptionBudget:
+    enabled: true
+
+# ── per-network presets ─────────────────────────────────────────────────────
+# The active network (.Values.network) selects one of these. Genesis for each is
+# BUNDLED in the chart (files/<genesisFile>) and rendered into a ConfigMap — no
+# manual download. Override an individual field with e.g.
+#   --set networks.testnet.rpcServers=...
+networks:
+  mainnet:
+    chainId: sovr-1
+    genesisFile: genesis-mainnet.json           # bundled; sha256 04529695…, height 1
+    seeds: "381af5e4d0d5e24af3bb4d506b06081399622d01@seed1.mainnet.sovrchain.net:32000,68d9058a5dd7062d72d917ae8f2a2e30101b5a74@seed2.mainnet.sovrchain.net:32001"
+    persistentPeers: ""                          # extra peers for default mode (seeds suffice)
+    archivePeer: "56715ebd90a2fec02dd7752e4b6e0c740de8fe94@archive1.mainnet.sovrchain.net:32101"
+    rpcServers: "https://rpc.sovrchain.net:443,https://rpc2.sovrchain.net:443"
+    # archive-mode from-genesis ladder: run each binary with --halt-height (commits
+    # boundary-1), swap by hand; the current binary (image.tag = v0.27.1) then
+    # applies v0.23.0-combined@1356994 and the later upgrades in-process to tip.
+    # Self-halt is NOT trusted — some tags (v0.16.2) carry a divergent later-upgrade
+    # handler and would fork the boundary block. Order matters. See
+    # mainnet-runbook/genesis-replay-ladder.md.
+    # NOTE: this ladder's tail (1356994 -> tip) was characterized with v0.23.0 as
+    # the genesis binary; with image.tag now v0.27.1 the tail also spans
+    # v0.24.0@1965923 + v0.27.0-combined@2044794 (applied in-process). Re-verify a
+    # full archive replay under v0.27.1 before relying on archive mode. The
+    # snapshot/default/validator paths are unaffected (they need the current binary).
+    bootstrap:
+      - { tag: v0.4.0,  haltHeight: 328000,  slot: "bootstrap/v0.4.0" }
+      - { tag: v0.5.0,  haltHeight: 751100,  slot: "bootstrap/v0.5.0" }
+      - { tag: v0.5.1,  haltHeight: 753000,  slot: "bootstrap/v0.5.1" }
+      - { tag: v0.5.2,  haltHeight: 757235,  slot: "bootstrap/v0.5.2" }
+      - { tag: v0.8.0,  haltHeight: 789785,  slot: "bootstrap/v0.8.0" }
+      - { tag: v0.12.0, haltHeight: 988336,  slot: "bootstrap/v0.12.0" }
+      - { tag: v0.16.2, haltHeight: 1210440, slot: "bootstrap/v0.16.2" }
+      - { tag: v0.20.1, haltHeight: 1356994, slot: "bootstrap/v0.20.1" }
+    # FUTURE x/upgrades only (post-tip). cosmovisor (genesis bin = image.tag) swaps
+    # by plan NAME. Empty until a proposal passes; then append
+    #   - { plan: <exact on-chain plan name>, tag: <image tag that applies it> }
+    # and redeploy before the upgrade height. Historical upgrades are handled by
+    # the --halt-height ladder above, NOT here.
+    upgrades: []
+    # Official sovr-1 archive-snapshot pin (spec 011): the mainnet bucket + the
+    # dedicated mainnet cosign PUBLIC key (keyed verify). Override/keyless
+    # precedence is documented once on the top-level `snapshot:` block, where
+    # crosscheckAnchors (rpc + rpc2) is also pre-filled.
+    snapshot:
+      baseUrl: https://svrn-chain-snapshots-mainnet.nyc3.digitaloceanspaces.com/snapshots
+      cosignPublicKey: |
+        -----BEGIN PUBLIC KEY-----
+        MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEv6XtLWy4H3IhmiLMUXEbRCeWswmX
+        S8Y3xuNHo96Bwt2TbZSnwxnn4sHbl1/2cTH+b85pb/zGRIfURBad2ZOpfA==
+        -----END PUBLIC KEY-----
+  testnet:
+    chainId: test-sovr-1
+    genesisFile: genesis-testnet.json           # bundled; sha256 5eb3be46…, height 1
+    seeds: "d5e5770e1198b6ab66dcf7bfadb90610e82bf6cd@seed1.testnet.sovrchain.net:32000,c24ded42a0026b4d912d8576b3d84d3c690b2d02@seed2.testnet.sovrchain.net:32001"
+    persistentPeers: "2dae62e74b0b175e7d905eeaca530464de8d8183@sentry1a.testnet.sovrchain.net:32200,5a5dca65a8fa75d66a65eca470d2c88d3c1c2703@sentry1b.testnet.sovrchain.net:32201,70ac5c238c5f83d6ef7480f64ec5c22d29364797@sentry2a.testnet.sovrchain.net:32220,c5385795047ac6a11d3328362033721ed3213657@sentry2b.testnet.sovrchain.net:32221,8cfacb1a936e3b848923a6fe631690336dc7717e@sentry3a.testnet.sovrchain.net:32240,dbf89f924f158c77222343d322e57eb1042b0a4c@sentry3b.testnet.sovrchain.net:32241"
+    archivePeer: "01e7a0fa3c7a8e7d0d96673d7a3127b2b9912228@archive1.testnet.sovrchain.net:32101"
+    rpcServers: "https://rpc.testnet.sovrchain.net:443,https://rpc.testnet.sovrchain.net:443"
+    # test-sovr-1's from-genesis ladder heights differ from mainnet and are NOT yet
+    # characterized, so archive mode is guarded OFF for testnet (default/state-sync
+    # works today). To enable it, characterize the ladder (query
+    # api.testnet.sovrchain.net .../applied_plan + replay per the runbook) and fill
+    # networks.testnet.bootstrap with the --halt-height stages.
+    bootstrap: []
+    upgrades: []          # FUTURE x/upgrades only (see mainnet.upgrades)
+    # Official test-sovr-1 archive-snapshot pin: the testnet bucket + a dedicated
+    # testnet cosign key (DIFFERENT from mainnet). Override/keyless precedence is
+    # documented once on the top-level `snapshot:` block.
+    snapshot:
+      baseUrl: https://svrn-chain-snapshots-testnet.nyc3.digitaloceanspaces.com/snapshots
+      cosignPublicKey: |
+        -----BEGIN PUBLIC KEY-----
+        MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAENMPGnHKXFIrui+QJXNntQR3Mtzxq
+        s/qUqYdBapvy4vtzT56ivvtu+DuQYpCMzPpvhJrgQyq054i7OXrUcfspeA==
+        -----END PUBLIC KEY-----
+
+# The current chain binary. In default mode this is the cosmovisor "genesis"
+# (running) binary; in archive mode it's used to scaffold config at init.
+image:
+  repository: ghcr.io/sovrn-tech/sovrd
+  tag: v0.27.1
+  pullPolicy: IfNotPresent
+# All ladder images are public — no pull secret needed. Add names here only if
+# you mirror them to a private registry.
+imagePullSecrets: []
+
+# ── cosmovisor runtime (downloaded once onto the data volume) ───────────────
+cosmovisor:
+  version: v1.7.0
+  # linux/amd64 tarball containing the `cosmovisor` binary. On an arm64 node the
+  # fetch init swaps `linux-amd64`->`linux-arm64` in this URL automatically.
+  # Override to pin a mirror or a different version (a custom URL is used as-is).
+  # %2F is the URL-encoded '/' in the release tag.
+  downloadUrl: "https://github.com/cosmos/cosmos-sdk/releases/download/cosmovisor%2Fv1.7.0/cosmovisor-v1.7.0-linux-amd64.tar.gz"
+  # Optional: if set, the tarball is sha256-verified after download.
+  sha256: ""
+  # Small image with curl + busybox (sha256sum/tar/grep/sed) for the fetch init.
+  downloadImage: curlimages/curl:8.10.1
+
+# soname + dir are identical across versions (dynamically linked); each slot
+# gets its OWN copy + an LD_LIBRARY_PATH wrapper so cosmovisor can mix versions.
+wasmvm:
+  soname: libwasmvm.x86_64.so
+  srcDir: /usr/local/lib
+
+# ── genesis override (default: the bundled per-network genesis above) ────────
+genesis:
+  # DEFAULT (both unset): the chart renders the active network's bundled genesis
+  # into a ConfigMap — self-contained, no manual download, deterministic for
+  # GitOps. Overrides below take precedence (e.g. an unlisted network):
+  configMap: ""          # use an EXISTING ConfigMap (key: genesis.json) instead
+  url: ""                # or fetch at init from this URL instead
+  sha256: ""             # optional integrity check for the URL download
+
+# ── state-sync (default mode only) ──────────────────────────────────────────
+stateSync:
+  # rpc_servers come from the active network preset (rpc + rpc2). CometBFT needs
+  # >=2 entries; rpc + rpc2 currently share a backend, so point one at your own
+  # node for genuinely independent light-client verification.
+  # If trustHash is empty and autoFetch is true, the fetch init derives a trust
+  # anchor from the first rpc server (latest height - offset). Set both explicitly
+  # for reproducibility (recommended for GitOps).
+  autoFetch: true
+  offset: 2000
+  trustHeight: 0
+  trustHash: ""
+
+# ── snapshot mode (mode=snapshot): restore a published, signed archive snapshot ──
+# Bootstraps a full-history node from a downloaded snapshot (spec 011) instead of
+# from-genesis replay — fast, self-serve, works from anywhere. Runs in a
+# curl-capable init container (the sovrd image's curl has no CA bundle) that
+# resolves latest.json, cosign-verifies the manifest, cross-checks its block_hash
+# against TWO independent anchors, sha256-verifies + extracts the tarball, then
+# the node blocksyncs the small remaining gap to head.
+snapshot:
+  # CANONICAL precedence for baseUrl + cosign verification (the per-network pins
+  # under networks.<net>.snapshot and the docs point here; keep the rule in ONE
+  # place). baseUrl and cosignPublicKey are pre-pinned per network (the official
+  # sovr-1 / test-sovr-1 buckets + keyed cosign public keys), so
+  # `--set mode=snapshot --set network=mainnet` verifies out of the box.
+  # Resolution, highest priority first:
+  #   1. an explicit value set HERE (top-level snapshot.*) — a private mirror or
+  #      your own re-signed snapshot;
+  #   2. keyless: if cosignIdentity/cosignIssuer are set, the cosignPublicKey pin
+  #      is skipped so restore-snapshot.sh takes the keyless (OIDC) branch;
+  #   3. otherwise the per-network pin (keyed verify against the trusted key).
+  # The chart appends /<network>/archive/latest.json to baseUrl.
+  #   DO Spaces:  https://<bucket>.<region>.digitaloceanspaces.com/snapshots
+  #               (or the .cdn. host); Cloudflare R2: your custom domain/r2.dev.
+  baseUrl: ""
+  cosignIdentity: ""          # keyless: the trusted cert identity (OIDC subject)
+  cosignIssuer: ""            # keyless: the OIDC issuer (both required for keyless verify)
+  cosignPublicKey: ""         # keyed verify; overrides networks.<net>.snapshot.cosignPublicKey
+  # TWO distinct RPC anchors (a list) whose block_hash must agree with the signed
+  # snapshot; only the first two are used. Both public anchors are pre-filled so
+  # mode=snapshot verifies out of the box. NOTE: rpc + rpc2 currently share a
+  # backend (rpc2 moves to a second datacenter later), so they don't yet provide
+  # fully *independent* verification — for maximum safety replace one with your
+  # own already-synced node or a trusted third-party RPC. (A comma-separated
+  # string is also accepted, for `--set` convenience.)
+  crosscheckAnchors:
+    - "https://rpc.sovrchain.net:443"
+    - "https://rpc2.sovrchain.net:443"
+  # image with curl+TLS for the restore init; restore-snapshot.sh apk-adds jq+zstd
+  # and fetches the cosign binary. Override for air-gap/mirrors.
+  restoreImage: curlimages/curl:8.10.1
+  cosignVersion: v2.4.1
+
+# ── node config knobs ───────────────────────────────────────────────────────
+config:
+  minGasPrices: "0usovr"
+  # archive operators generally want "nothing"; defaults to "nothing" in archive
+  # mode and "default" in sync mode unless you set it here.
+  pruning: ""
+  # Go soft memory limit (GOMEMLIMIT). Left empty, the chart derives it as ~75% of
+  # resources.limits.memory so Go GCs before the cgroup OOM-kills the pod (an OOM
+  # on mainnet's tight downtime window jails + slashes you). Set explicitly (e.g.
+  # "12GiB") to override. So keep resources.limits.memory realistic for the node.
+  goMemLimit: ""
+
+# ── storage ─────────────────────────────────────────────────────────────────
+persistence:
+  enabled: true
+  storageClass: ""       # e.g. a local-NVMe class for archive; longhorn otherwise
+  accessModes: ["ReadWriteOnce"]
+  size: 200Gi            # archive grows large; a pruned default node needs less
+
+# ── scheduling / resources ──────────────────────────────────────────────────
+resources:
+  requests:
+    cpu: "2"
+    memory: 8Gi
+  limits:
+    cpu: "8"
+    memory: 16Gi
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Run EVERY container (curl fetch init, per-version staging inits, main sovrd) as
+# the sovrd image's `sovr` user (uid/gid 1000) + fsGroup 1000, so all files on the
+# shared data volume are uniformly sovr-owned. This is required: relying on fsGroup
+# alone fails on CSIs that don't propagate the setgid bit — the curl init (uid 100)
+# then creates config/ with its own group, and sovrd init (uid 1000) can't write
+# into it ("client.toml: permission denied"). Cluster-verified on RKE2 + local-path.
+podSecurityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+securityContext: {}
+
+# ── service ─────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  ports:
+    p2p: 26656
+    rpc: 26657
+    grpc: 9090
+    api: 1317
+
+# Readiness only by default. A liveness probe is intentionally OFF: it would
+# restart the pod during a multi-day archive sync. Enable with care.
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 30
+  periodSeconds: 30
+livenessProbe:
+  enabled: false
+  initialDelaySeconds: 300
+  periodSeconds: 60

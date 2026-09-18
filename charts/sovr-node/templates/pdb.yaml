@@ -1,0 +1,16 @@
+{{- if and .Values.validator.enabled .Values.validator.podDisruptionBudget.enabled }}
+# Protects the single validator pod from casual voluntary eviction (node drain).
+# minAvailable:1 on a replicas=1 StatefulSet blocks eviction until an operator
+# cordons/handles the node deliberately — an eviction means missed blocks.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sovr-node.fullname" . }}
+  labels:
+    {{- include "sovr-node.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "sovr-node.selectorLabels" . | nindent 6 }}
+{{- end }}

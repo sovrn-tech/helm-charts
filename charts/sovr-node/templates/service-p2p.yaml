@@ -1,0 +1,33 @@
+{{- if and .Values.validator.enabled .Values.validator.p2pService.enabled }}
+# External P2P service for a validator. Exposes ONLY p2p (26656) — a validator's
+# RPC/gRPC/API must stay private (that's the default ClusterIP `service`). Set
+# validator.externalAddress to the address peers reach this on (LB IP/DNS, or a
+# node IP:nodePort), and disable this if you front P2P yourself.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sovr-node.fullname" . }}-p2p
+  labels:
+    {{- include "sovr-node.labels" . | nindent 4 }}
+  {{- with .Values.validator.p2pService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.validator.p2pService.type }}
+  {{- if .Values.validator.p2pService.loadBalancerIP }}
+  loadBalancerIP: {{ .Values.validator.p2pService.loadBalancerIP | quote }}
+  {{- end }}
+  # Preserve the peer's source IP where the platform supports it.
+  externalTrafficPolicy: Local
+  selector:
+    {{- include "sovr-node.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: p2p
+      port: {{ .Values.service.ports.p2p }}
+      targetPort: p2p
+      protocol: TCP
+      {{- if and (eq .Values.validator.p2pService.type "NodePort") .Values.validator.p2pService.nodePort }}
+      nodePort: {{ .Values.validator.p2pService.nodePort }}
+      {{- end }}
+{{- end }}

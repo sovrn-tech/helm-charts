@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sovr-node.fullname" . }}-headless
+  labels:
+    {{- include "sovr-node.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "sovr-node.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: p2p
+      port: {{ .Values.service.ports.p2p }}
+      targetPort: p2p
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sovr-node.fullname" . }}
+  labels:
+    {{- include "sovr-node.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "sovr-node.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: rpc
+      port: {{ .Values.service.ports.rpc }}
+      targetPort: rpc
+    - name: grpc
+      port: {{ .Values.service.ports.grpc }}
+      targetPort: grpc
+    - name: api
+      port: {{ .Values.service.ports.api }}
+      targetPort: api
+    - name: p2p
+      port: {{ .Values.service.ports.p2p }}
+      targetPort: p2p
