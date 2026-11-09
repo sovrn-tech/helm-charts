@@ -28,7 +28,17 @@ data:
     H="$HOME_DIR"
     mkdir -p "$H/runtime" "$H/config"
     chmod g+rwx "$H" "$H/runtime" "$H/config" 2>/dev/null || true
-    if [ ! -x "$H/runtime/cosmovisor" ]; then
+    # The pin that produced the installed cosmovisor is recorded next to it, so a
+    # `cosmovisor.downloadUrl` / `cosmovisor.version` bump takes effect on an
+    # EXISTING volume too (before 0.3.0 the download was skipped whenever any
+    # cosmovisor binary was present, making pin bumps silent no-ops). The marker
+    # is new in 0.3.0, so the first start after that upgrade re-downloads once.
+    MARK="$H/runtime/.cosmovisor-source"
+    have=""; [ -f "$MARK" ] && have=$(cat "$MARK" 2>/dev/null || true)
+    if [ ! -x "$H/runtime/cosmovisor" ] || [ "$have" != "$COSMOVISOR_URL" ]; then
+      if [ -x "$H/runtime/cosmovisor" ]; then
+        echo "[fetch] cosmovisor pin changed (${have:-unrecorded} -> $COSMOVISOR_URL) -- re-downloading"
+      fi
       # cosmovisor.downloadUrl defaults to the linux-amd64 asset; on arm64 swap
       # the arch token so the binary matches the node (custom URLs pass through).
       CVURL="$COSMOVISOR_URL"
@@ -38,8 +48,12 @@ data:
       echo "[fetch] cosmovisor <- $CVURL"
       curl -fsSL "$CVURL" -o /tmp/cv.tgz
       if [ -n "$COSMOVISOR_SHA256" ]; then echo "$COSMOVISOR_SHA256  /tmp/cv.tgz" | sha256sum -c -; fi
-      tar -xzf /tmp/cv.tgz -C "$H/runtime" cosmovisor 2>/dev/null || tar -xzf /tmp/cv.tgz -C "$H/runtime"
-      chmod +x "$H/runtime/cosmovisor"
+      rm -rf "$H/runtime/.cv-new"; mkdir -p "$H/runtime/.cv-new"
+      tar -xzf /tmp/cv.tgz -C "$H/runtime/.cv-new" cosmovisor 2>/dev/null || tar -xzf /tmp/cv.tgz -C "$H/runtime/.cv-new"
+      chmod +x "$H/runtime/.cv-new/cosmovisor"
+      mv -f "$H/runtime/.cv-new/cosmovisor" "$H/runtime/cosmovisor"
+      rm -rf "$H/runtime/.cv-new" /tmp/cv.tgz
+      printf '%s\n' "$COSMOVISOR_URL" > "$MARK"
     fi
     if [ -n "$GENESIS_URL" ] && [ ! -f "$H/config/genesis.json" ] && [ ! -f "$H/config/genesis.json.src" ]; then
       echo "[fetch] genesis <- $GENESIS_URL"
@@ -121,17 +135,40 @@ data:
     echo "[init] config patched (mode=$MODE)"
 
   # initContainer 3..N (one per version image): stage sovrd + its libwasmvm + wrapper.
+  # Idempotent, and it RE-STAGES when the slot's binary, libwasmvm or wrapper
+  # differs from the image's: an `image.tag` bump (genesis slot), a corrected
+  # upgrade tag or a wrapper change now takes effect on an existing volume
+  # (before 0.3.0 any staged binary was kept, so the pod spec changed while the
+  # node silently kept running the old binary).
+  # Files are copied under temp names and `mv`ed last, so an interrupted init
+  # never leaves a slot with a half-written binary.
   stage.sh: |
     #!/bin/sh
     set -eu
     umask 0002
     S="$HOME_DIR/cosmovisor/$SLOT"
-    if [ -x "$S/bin/sovrd.real" ]; then echo "[stage] $SLOT already staged"; exit 0; fi
+    SRC="${SOVRD_BIN:-/usr/local/bin/sovrd}"
+    WRAP="${WRAPPER_SH:-/scripts/wrapper.sh}"
+    LIB="$WASMVM_SRCDIR/$WASMVM_SONAME"
+    same_file() {
+      if command -v cmp >/dev/null 2>&1; then cmp -s "$1" "$2"; else
+        [ "$(sha256sum "$1" | cut -d' ' -f1)" = "$(sha256sum "$2" | cut -d' ' -f1)" ]; fi
+    }
+    if [ -x "$S/bin/sovrd.real" ] && [ -x "$S/bin/sovrd" ] && [ -f "$S/lib/$WASMVM_SONAME" ] \
+       && same_file "$SRC" "$S/bin/sovrd.real" && same_file "$LIB" "$S/lib/$WASMVM_SONAME" && same_file "$WRAP" "$S/bin/sovrd"; then
+      echo "[stage] $SLOT already staged (binary, libwasmvm and wrapper match the image)"; exit 0
+    fi
+    if [ -x "$S/bin/sovrd.real" ]; then
+      echo "[stage] $SLOT: staged binary, libwasmvm or wrapper differs from the image (or the slot is incomplete) -- re-staging"
+    fi
     mkdir -p "$S/bin" "$S/lib"
-    cp /usr/local/bin/sovrd "$S/bin/sovrd.real"
-    cp "$WASMVM_SRCDIR/$WASMVM_SONAME" "$S/lib/$WASMVM_SONAME"
-    cp /scripts/wrapper.sh "$S/bin/sovrd"
-    chmod +x "$S/bin/sovrd" "$S/bin/sovrd.real"
+    cp "$SRC" "$S/bin/.sovrd.real.tmp"
+    cp "$LIB" "$S/lib/.$WASMVM_SONAME.tmp"
+    cp "$WRAP" "$S/bin/.sovrd.tmp"
+    chmod +x "$S/bin/.sovrd.real.tmp" "$S/bin/.sovrd.tmp"
+    mv -f "$S/lib/.$WASMVM_SONAME.tmp" "$S/lib/$WASMVM_SONAME"
+    mv -f "$S/bin/.sovrd.tmp" "$S/bin/sovrd"
+    mv -f "$S/bin/.sovrd.real.tmp" "$S/bin/sovrd.real"
     echo "[stage] $SLOT staged"
 
   # archive-mode bootstrap: drive the from-genesis ladder with --halt-height at
@@ -257,15 +294,179 @@ data:
       *) echo "[snapshot] ERROR: unknown format $file"; exit 1 ;;
     esac
     [ -d "$H/data" ] || { echo "[snapshot] ERROR: extraction produced no data/"; exit 1; }
-    # A published snapshot's data/ carries the producer's last upgrade-info.json.
-    # That upgrade is already applied in the restored state, but cosmovisor would
-    # read it and try to swap to an upgrades/<name> binary that isn't staged
-    # (the current/genesis binary already includes it). Remove it so cosmovisor
-    # just runs the current binary. (mode=default state-sync never has this file.)
-    rm -f "$H/data/upgrade-info.json"
+    # A published snapshot's data/ carries the producer's last upgrade-info.json
+    # (x/upgrade writes it at the halt). It is KEPT: the startup switch
+    # (switch-pending-upgrade.sh) picks the newest staged binary for it and
+    # records the plan into that slot, so a node installed from a post-height
+    # snapshot boots the right version even while image.tag still names the
+    # pre-height one, and cosmovisor never mistakes the file for a newer upgrade.
+    # (Before 0.3.0 the file was deleted here because cosmovisor 1.7.x would
+    # otherwise kill the genesis binary and fail on the missing slot.)
+    if [ -s "$H/data/upgrade-info.json" ]; then
+      echo "[snapshot] keeping data/upgrade-info.json ($(tr -d '\n' < "$H/data/upgrade-info.json" | cut -c1-120)...); the startup switch selects the binary"
+    fi
     rm -rf "$W"; touch "$H/.snapshot-restored"
     chown -R 1000:1000 "$H/data" "$H/.snapshot-restored" 2>/dev/null || true
     echo "[snapshot] restored to height $height; node will blocksync the gap to head"
+
+  # Shared helpers, sourced by the upgrade scripts (`. "$SCRIPTS_DIR/lib.sh"`).
+  lib.sh: |
+    # upgrade_info_field FILE KEY -> prints the first top-level string/number
+    # value of KEY in an x/upgrade upgrade-info.json. x/upgrade marshals the
+    # Plan as {"name":..,"time":..,"height":..,"info":..} in that order, so the
+    # FIRST match is the real field even when `info` quotes the same words.
+    # jq is preferred when the image has it; the grep path needs only POSIX
+    # tools (sovrd images before 0.28 ship no jq).
+    upgrade_info_field() {
+      if [ -z "${UPGRADE_INFO_NO_JQ:-}" ] && command -v jq >/dev/null 2>&1; then
+        jq -r --arg k "$2" '.[$k] // empty' "$1" 2>/dev/null
+      else
+        grep -oE "\"$2\"[[:space:]]*:[[:space:]]*\"?[^\",}]*\"?" "$1" 2>/dev/null \
+          | head -1 | sed -e 's/^"[^"]*"[[:space:]]*:[[:space:]]*//' -e 's/^"//' -e 's/"$//'
+      fi
+    }
+
+    # sovrd_version BIN -> the binary's own `sovrd version` (through its slot
+    # wrapper, which supplies its libwasmvm); empty when it cannot be read.
+    sovrd_version() { "$1" version 2>/dev/null | head -1 | tr -d '[:space:]'; }
+
+    # ver_cmp A B -> prints -1, 0 or 1 for A <, =, > B. Versions look like
+    # [v]MAJOR.MINOR.PATCH[-suffix]. The numeric fields decide; on a tie a
+    # release beats a pre-release (-rc1, -beta…) and a git-describe build past
+    # the release tag (-N-gHASH, what `make build` stamps) beats the release.
+    # Within a rank: pre-releases compare by their numeric tail when the label
+    # matches (rc1 < rc2) and by plain string order otherwise; describe builds
+    # compare by distance (-10-g… < -20-g…). A describe build past an rc tag
+    # (-rc2-5-g…) is still a pre-release, newer than -rc2 and older than the
+    # release.
+    num_cmp() { if [ "$1" -gt "$2" ]; then echo 1; elif [ "$1" -lt "$2" ]; then echo -1; else echo 0; fi; }
+    ver_cmp() {
+      a=${1#v}; b=${2#v}; an=${a%%-*}; bn=${b%%-*}; as=${a#"$an"}; bs=${b#"$bn"}
+      i=1
+      while [ "$i" -le 3 ]; do
+        x=$(printf '%s' "$an" | cut -d. -f"$i"); y=$(printf '%s' "$bn" | cut -d. -f"$i")
+        x=${x:-0}; y=${y:-0}
+        case "$x$y" in
+          *[!0-9]*) ;;
+          *) r=$(num_cmp "$x" "$y"); [ "$r" = 0 ] || { echo "$r"; return; } ;;
+        esac
+        i=$((i + 1))
+      done
+      ver_rank() { case "$1" in "") echo 1 ;; -[0-9]*-g*) echo 2 ;; *) echo 0 ;; esac; }
+      ra=$(ver_rank "$as"); rb=$(ver_rank "$bs")
+      r=$(num_cmp "$ra" "$rb"); [ "$r" = 0 ] || { echo "$r"; return; }
+      case "$ra" in
+        1) echo 0 ;;
+        2) da=${as#-}; da=${da%%-*}; db=${bs#-}; db=${db%%-*}; num_cmp "$da" "$db" ;;
+        0) ta=${as#-}; tb=${bs#-}
+           da=0; db=0
+           case "$ta" in
+             *-[0-9]*-g*) base=${ta%-g*}; da=${base##*-}; ta=${base%-*} ;;
+           esac
+           case "$tb" in
+             *-[0-9]*-g*) base=${tb%-g*}; db=${base##*-}; tb=${base%-*} ;;
+           esac
+           la=$(printf '%s' "$ta" | sed 's/[0-9]*$//'); lb=$(printf '%s' "$tb" | sed 's/[0-9]*$//')
+           na=${ta#"$la"}; nb=${tb#"$lb"}
+           if [ "$la" = "$lb" ] && [ -n "$na$nb" ]; then r=$(num_cmp "${na:-0}" "${nb:-0}")
+           elif [ "$ta" = "$tb" ]; then r=0
+           elif [ "$(printf '%s\n%s\n' "$ta" "$tb" | sort | head -1)" = "$ta" ]; then r=-1
+           else r=1; fi
+           if [ "$r" = 0 ]; then num_cmp "$da" "$db"; else echo "$r"; fi ;;
+      esac
+    }
+
+  # Run by run.sh on EVERY start, before cosmovisor: choose the binary cosmovisor
+  # runs. Candidates are the genesis slot (image.tag), the slot `current` points
+  # at today, and -- when data/upgrade-info.json (written by x/upgrade at the
+  # halt) names a plan staged under cosmovisor/upgrades/<plan> -- that plan's
+  # slot. The NEWEST `sovrd version` wins (ties go to genesis), so:
+  #   * at a halt, image.tag v0.27.4 + a staged v0.28.0 plan slot -> the plan slot
+  #     (the upgrade handler runs on the next start);
+  #   * after the height, moving image.tag to v0.28.1 -> back to genesis (the
+  #     bump is not a silent no-op; a newer release carries the older handlers);
+  #   * a kept `upgrades` entry can never roll the node back to an older binary.
+  # The chosen slot also gets a copy of data/upgrade-info.json: cosmovisor reads
+  # current/upgrade-info.json to learn which plan the running binary belongs to,
+  # and would otherwise swap to the plan's slot (even an older one) the moment
+  # `sovrd status` answers. Needed in the first place because the pinned
+  # cosmovisor (1.7.x) only switches after a successful `status` whose height
+  # has reached the plan height -- at a real halt the app has already panicked,
+  # so `status` fails, the check is false, cosmovisor exits with the app's error
+  # and the old binary replays the halt block forever (cosmos/cosmos-sdk#26091,
+  # #22731; the fix #23720 is in no released cosmovisor). With this script the
+  # halt costs exactly one automatic container restart. It never fails the start.
+  switch-pending-upgrade.sh: |
+    #!/bin/sh
+    set -u
+    . "${SCRIPTS_DIR:-/scripts}/lib.sh"
+    H="$HOME_DIR"; ROOT="$H/cosmovisor"; INFO="$H/data/upgrade-info.json"
+    log() { echo "[switch] $*"; }
+    [ -x "$ROOT/genesis/bin/sovrd" ] || { log "WARN: no genesis slot staged; leaving cosmovisor alone"; exit 0; }
+    # What cosmovisor would run now: "", "genesis" or "upgrades/<name>" (the
+    # link is relative; an absolute one from an older hand fix is normalized).
+    cur=""
+    if [ -L "$ROOT/current" ]; then cur=$(readlink "$ROOT/current" 2>/dev/null || true); fi
+    cur=${cur#"$ROOT/"}; cur=${cur%/}
+    if [ -n "$cur" ] && [ ! -x "$ROOT/$cur/bin/sovrd" ]; then
+      log "current -> $cur is dangling (its slot is gone); falling back to genesis"; cur=""
+    fi
+    # The plan x/upgrade recorded, if any, and its slot when staged.
+    name=""; height=""; pslot=""
+    if [ -s "$INFO" ]; then
+      name=$(upgrade_info_field "$INFO" name); height=$(upgrade_info_field "$INFO" height)
+      if [ -z "$name" ]; then
+        log "WARN: cannot read the plan name from $INFO"
+      elif [ -x "$ROOT/upgrades/$name/bin/sovrd" ]; then
+        pslot="upgrades/$name"
+      else
+        log "plan $name@${height:-?} is recorded but upgrades/$name is not staged (if it is still pending, add it to networks.<network>.upgrades)"
+      fi
+    fi
+    # Versions of the candidates.
+    gv=$(sovrd_version "$ROOT/genesis/bin/sovrd")
+    xv=""; if [ -n "$cur" ] && [ "$cur" != genesis ]; then xv=$(sovrd_version "$ROOT/$cur/bin/sovrd"); fi
+    pv=""; if [ -n "$pslot" ] && [ "$pslot" != "$cur" ]; then pv=$(sovrd_version "$ROOT/$pslot/bin/sovrd"); fi
+    unreadable=0
+    [ -n "$gv" ] || unreadable=1
+    if [ -n "$cur" ] && [ "$cur" != genesis ] && [ -z "$xv" ]; then unreadable=1; fi
+    if [ -n "$pslot" ] && [ "$pslot" != "$cur" ] && [ -z "$pv" ]; then unreadable=1; fi
+    if [ "$unreadable" = 1 ]; then
+      # Cannot compare: trust the operator's plan mapping for a pending plan,
+      # otherwise stay where we are.
+      if [ -n "$pslot" ] && [ "$pslot" != "$cur" ]; then
+        best="$pslot"; why="plan $name@${height:-?} is staged as upgrades/$name (versions unreadable: genesis='$gv' plan='$pv')"
+      else
+        best="${cur:-genesis}"; why="versions unreadable (genesis='$gv' current='$xv'); keeping the current selection"
+      fi
+      log "WARN: could not read every binary's version"
+    else
+      best=genesis; bestv="$gv"; why="image.tag binary $gv is the newest staged"
+      if [ -n "$xv" ] && [ "$(ver_cmp "$xv" "$bestv")" -gt 0 ]; then
+        best="$cur"; bestv="$xv"; why="active slot $cur ($xv) is newer than the image.tag binary ($gv)"
+      fi
+      if [ -n "$pv" ] && [ "$(ver_cmp "$pv" "$bestv")" -gt 0 ]; then
+        best="$pslot"; bestv="$pv"; why="plan $name@${height:-?} is pending and upgrades/$name ($pv) is newer than ${cur:-genesis} ($( [ -n "$xv" ] && echo "$xv" || echo "$gv" ))"
+      elif [ -n "$pslot" ] && [ "$pslot" != "$cur" ]; then
+        why="$why; plan $name@${height:-?} is staged as $pv but not newer, so it is not activated"
+      fi
+    fi
+    # Mirror the recorded plan into the selected slot (see the header comment).
+    if [ -s "$INFO" ] && ! cmp -s "$INFO" "$ROOT/$best/upgrade-info.json" 2>/dev/null; then
+      if cp "$INFO" "$ROOT/$best/.upgrade-info.json.tmp" && mv -f "$ROOT/$best/.upgrade-info.json.tmp" "$ROOT/$best/upgrade-info.json"; then
+        log "recorded plan ${name:-?}@${height:-?} into $best/upgrade-info.json"
+      else
+        log "WARN: could not write $best/upgrade-info.json"
+      fi
+    fi
+    # Same relative link cosmovisor's SetCurrentUpgrade writes (its workdir is
+    # the cosmovisor dir).
+    if [ "$best" != "$cur" ]; then
+      if ln -sfn "$best" "$ROOT/current"; then log "current ${cur:-<unset>} -> $best: $why"; else log "WARN: could not re-point current to $best; cosmovisor keeps ${cur:-genesis}"; fi
+    else
+      log "current -> $cur unchanged: $why"
+    fi
+    exit 0
 
   # main container entrypoint.
   run.sh: |
@@ -275,6 +476,15 @@ data:
     export DAEMON_NAME=sovrd
     export DAEMON_RESTART_AFTER_UPGRADE=true
     export DAEMON_ALLOW_DOWNLOAD_BINARIES=false
+    # Slot directories are named after the exact on-chain Plan.Name; stop
+    # cosmovisor lowercasing the name it reads from upgrade-info.json (its
+    # default), or a mixed-case plan would never be found.
+    export COSMOVISOR_DISABLE_RECASE=true
+    # cosmovisor's own switch (when it does run) first copies the whole data/ dir
+    # unless this is set -- minutes of extra downtime and 2x disk. The startup
+    # switch below never backs up. Set cosmovisor.skipBackup=false to keep backups.
+    export UNSAFE_SKIP_BACKUP="${COSMOVISOR_SKIP_BACKUP:-true}"
     if [ "$MODE" = "archive" ]; then /scripts/bootstrap.sh; fi
+    sh /scripts/switch-pending-upgrade.sh || echo "[run] WARN: switch-pending-upgrade.sh failed; starting cosmovisor anyway"
     echo "[run] starting cosmovisor (mode=$MODE)"
     exec "$HOME_DIR/runtime/cosmovisor" run start --home "$HOME_DIR"

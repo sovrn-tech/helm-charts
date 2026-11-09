@@ -4,3 +4,5 @@
 *.tmp
 *.bak
 *.swp
+# offline script tests (not part of the packaged chart)
+tests/

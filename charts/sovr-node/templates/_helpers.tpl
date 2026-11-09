@@ -52,8 +52,9 @@ rendered by templates/genesis-configmap.yaml) — self-contained, no manual step
 {{/*
 Staging list: which (image tag -> cosmovisor slot) copies to run as init
 containers. BOTH modes stage the cosmovisor "genesis" (running) binary
-(image.tag = v0.23.0) plus any FUTURE upgrade slots (networks.<net>.upgrades,
-empty by default). Archive mode ALSO stages the from-genesis --halt-height
+(image.tag) plus the upgrade slots (networks.<net>.upgrades: one per passed
+x/upgrade plan whose binary differs from image.tag; the plan name is the
+slot's directory name, verbatim). Archive mode ALSO stages the from-genesis --halt-height
 ladder binaries (bootstrap/*). Returns a list of dicts {tag, slot}.
 */}}
 {{- define "sovr-node.stagingList" -}}
@@ -136,6 +137,8 @@ ConfigMap scripts stay generic.
   value: {{ .Values.cosmovisor.downloadUrl | quote }}
 - name: COSMOVISOR_SHA256
   value: {{ .Values.cosmovisor.sha256 | quote }}
+- name: COSMOVISOR_SKIP_BACKUP
+  value: {{ .Values.cosmovisor.skipBackup | quote }}
 - name: GENESIS_URL
   value: {{ .Values.genesis.url | quote }}
 - name: GENESIS_SHA256

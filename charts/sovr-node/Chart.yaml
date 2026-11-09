@@ -5,11 +5,12 @@ description: >-
   "default" (state-sync), "archive" (from-genesis binary-ladder replay), and
   "snapshot" (restore a signed archive snapshot). An optional validator overlay
   runs it as a signing validator with an operator-supplied consensus key. All
-  converge on cosmovisor, which drives every future x/upgrade.
+  converge on cosmovisor plus the chart's startup switch, which together apply
+  every x/upgrade whose binary is staged via networks.<network>.upgrades.
 type: application
-version: 0.2.1
+version: 0.3.0
 # The current chain binary this chart ships as the running / state-sync image.
-appVersion: "v0.27.1"
+appVersion: "v0.27.4"
 keywords:
   - cosmos
   - sovr

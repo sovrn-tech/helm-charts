@@ -1,8 +1,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # sovr-node — a cosmovisor-managed SOVR chain node.
 #
-# Pick a NETWORK and a bring-up MODE. All modes run under cosmovisor, so once
-# synced they auto-halt + swap binary + resume at every FUTURE x/upgrade.
+# Pick a NETWORK and a bring-up MODE. All modes run under cosmovisor. At every
+# x/upgrade height the node halts, and -- provided the plan's binary is staged
+# via networks.<network>.upgrades (see README "Chain upgrades") -- the chart's
+# startup switch boots that binary on the next container start and the node
+# resumes. Without the entry it stays halted (safe, but stuck) until you add it.
 #
 #   network: mainnet | testnet   -> selects genesis, chain-id, peers, rpc, ladder
 #   mode:    default | archive | snapshot
@@ -78,15 +81,16 @@ networks:
     archivePeer: "56715ebd90a2fec02dd7752e4b6e0c740de8fe94@archive1.mainnet.sovrchain.net:32101"
     rpcServers: "https://rpc.sovrchain.net:443,https://rpc2.sovrchain.net:443"
     # archive-mode from-genesis ladder: run each binary with --halt-height (commits
-    # boundary-1), swap by hand; the current binary (image.tag = v0.27.1) then
-    # applies v0.23.0-combined@1356994 and the later upgrades in-process to tip.
+    # boundary-1), swap by hand; the current binary (image.tag) then applies
+    # v0.23.0-combined@1356994 and the later upgrades in-process to tip.
     # Self-halt is NOT trusted — some tags (v0.16.2) carry a divergent later-upgrade
     # handler and would fork the boundary block. Order matters.
     # NOTE: this ladder's tail (1356994 -> tip) was characterized with v0.23.0 as
-    # the genesis binary; with image.tag now v0.27.1 the tail also spans
-    # v0.24.0@1965923 + v0.27.0-combined@2044794 (applied in-process). Re-verify a
-    # full archive replay under v0.27.1 before relying on archive mode. The
-    # snapshot/default/validator paths are unaffected (they need the current binary).
+    # the genesis binary; with image.tag now v0.27.4 the tail also spans
+    # v0.24.0@1965923, v0.27.0-combined@2044794 and the v0.27.4-emission-rollback
+    # fork at 2633375 (applied in-process). Re-verify a full archive replay under
+    # the current image.tag before relying on archive mode. The snapshot/default/
+    # validator paths are unaffected (they need the current binary).
     bootstrap:
       - { tag: v0.4.0,  haltHeight: 328000,  slot: "bootstrap/v0.4.0" }
       - { tag: v0.5.0,  haltHeight: 751100,  slot: "bootstrap/v0.5.0" }
@@ -96,12 +100,18 @@ networks:
       - { tag: v0.12.0, haltHeight: 988336,  slot: "bootstrap/v0.12.0" }
       - { tag: v0.16.2, haltHeight: 1210440, slot: "bootstrap/v0.16.2" }
       - { tag: v0.20.1, haltHeight: 1356994, slot: "bootstrap/v0.20.1" }
-    # FUTURE x/upgrades only (post-tip). cosmovisor (genesis bin = image.tag) swaps
-    # by plan NAME. Empty until a proposal passes; then append
-    #   - { plan: <exact on-chain plan name>, tag: <image tag that applies it> }
-    # and redeploy before the upgrade height. Historical upgrades are handled by
-    # the --halt-height ladder above, NOT here.
-    upgrades: []
+    # x/upgrade plans whose binary is NOT the image.tag binary, keyed by the exact
+    # on-chain Plan.Name (used verbatim as the slot directory name). Each entry
+    # stages <tag>'s sovrd under cosmovisor/upgrades/<plan>; at the plan height
+    # the node halts, x/upgrade writes data/upgrade-info.json, and the startup
+    # switch boots that slot on the next container start. Append an entry as soon
+    # as a proposal passes and roll it out BEFORE the height. Entries may stay
+    # indefinitely: the switch always runs the NEWEST staged binary, so once
+    # image.tag moves past a plan's tag the entry is inert (it can never roll a
+    # node back). Historical upgrades are handled by the --halt-height ladder
+    # above, NOT here.
+    upgrades:
+      - { plan: v0.28.0-security-hardening, tag: v0.28.0 }   # sovr-1 proposal 17, height 2819382
     # Official sovr-1 archive-snapshot pin: the mainnet bucket + the
     # dedicated mainnet cosign PUBLIC key (keyed verify). Override/keyless
     # precedence is documented once on the top-level `snapshot:` block, where
@@ -126,7 +136,14 @@ networks:
     # api.testnet.sovrchain.net .../applied_plan + replay per the runbook) and fill
     # networks.testnet.bootstrap with the --halt-height stages.
     bootstrap: []
-    upgrades: []          # FUTURE x/upgrades only (see mainnet.upgrades)
+    # test-sovr-1 applied both plans with the v0.28.0 binary (one binary for the
+    # v0.28 line): v0.28.0-security-hardening @ 1903068, v0.28.1-fixed-price-t02-t09
+    # @ 2424507. A node installed from a post-height snapshot boots v0.28.0 through
+    # the switch; mode=default (state-sync) has no upgrade-info.json to key off, so
+    # on testnet also set image.tag=v0.28.0 (see README "Chain upgrades").
+    upgrades:
+      - { plan: v0.28.0-security-hardening,    tag: v0.28.0 }
+      - { plan: v0.28.1-fixed-price-t02-t09,   tag: v0.28.0 }
     # Official test-sovr-1 archive-snapshot pin: the testnet bucket + a dedicated
     # testnet cosign key (DIFFERENT from mainnet). Override/keyless precedence is
     # documented once on the top-level `snapshot:` block.
@@ -138,11 +155,16 @@ networks:
         s/qUqYdBapvy4vtzT56ivvtu+DuQYpCMzPpvhJrgQyq054i7OXrUcfspeA==
         -----END PUBLIC KEY-----
 
-# The current chain binary. In default mode this is the cosmovisor "genesis"
-# (running) binary; in archive mode it's used to scaffold config at init.
+# The current chain binary: the cosmovisor "genesis" (running) binary, also used
+# to scaffold config at init. RULE: never move this to a plan's binary BEFORE
+# that plan's height -- a binary that carries a pending plan's handler refuses
+# to run ("BINARY UPDATED BEFORE TRIGGER") or forks. Stage the new binary via
+# networks.<network>.upgrades instead; move image.tag only once the height has
+# passed. Since 0.3.0 a tag change re-stages the genesis slot on existing
+# volumes (it used to be a silent no-op there).
 image:
   repository: ghcr.io/sovrn-tech/sovrd
-  tag: v0.27.1
+  tag: v0.27.4
   pullPolicy: IfNotPresent
 # All ladder images are public — no pull secret needed. Add names here only if
 # you mirror them to a private registry.
@@ -158,6 +180,14 @@ cosmovisor:
   downloadUrl: "https://github.com/cosmos/cosmos-sdk/releases/download/cosmovisor%2Fv1.7.0/cosmovisor-v1.7.0-linux-amd64.tar.gz"
   # Optional: if set, the tarball is sha256-verified after download.
   sha256: ""
+  # UNSAFE_SKIP_BACKUP for cosmovisor's OWN switch path. With the pinned 1.7.x
+  # the chart's startup switch drives every halt and never copies data/, so this
+  # value changes nothing today. Once a fixed cosmovisor performs the switch
+  # itself: true (default) skips its full pre-upgrade copy of data/; false keeps
+  # that rollback aid at the cost of 2x disk on the PVC and minutes of extra
+  # downtime at the height. Validators who want the copy: set false, size the
+  # volume for it.
+  skipBackup: true
   # Small image with curl + busybox (sha256sum/tar/grep/sed) for the fetch init.
   downloadImage: curlimages/curl:8.10.1
 

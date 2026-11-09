@@ -43,18 +43,25 @@ mainnet, `mode=snapshot`) — see **Running a validator** below.
   own `libwasmvm`** into its cosmovisor slot, fronted by a wrapper that sets
   `LD_LIBRARY_PATH` to that slot's lib — this lets the historical binaries run
   despite needing different libwasmvm versions that share a soname. All modes
-  stage the current binary (`v0.27.1`) as the cosmovisor genesis bin; archive mode
-  also stages the eight from-genesis ladder binaries (`v0.4.0…v0.20.1`).
+  stage the current binary (`image.tag`) as the cosmovisor genesis bin plus one
+  `upgrades/<plan>` slot per entry in `networks.<network>.upgrades`; archive mode
+  also stages the eight from-genesis ladder binaries (`v0.4.0…v0.20.1`). Staging
+  re-copies a slot whenever its binary differs from the image, so a tag change
+  takes effect on an existing volume.
 - **main container** runs `run.sh`. In **archive** mode it first drives the
   from-genesis ladder: each binary with `--halt-height <boundary>` (commits
   boundary−1), swapping to the next, through `v0.20.1 --halt-height 1356994`.
-  Then it `exec`s cosmovisor with `v0.27.1` (the genesis bin), which applies
+  Then it `exec`s cosmovisor with the genesis bin (`image.tag`), which applies
   `v0.23.0-combined@1356994` and the later upgrades (`v0.24.0@1965923`,
-  `v0.27.0-combined@2044794`) in-process to tip. **Self-halt is not trusted** —
-  `v0.16.2` carries a divergent `v0.20.0-combined` handler and would fork block
-  1,210,440, so every boundary is force-capped with `--halt-height`.
+  `v0.27.0-combined@2044794`, the `v0.27.4` fork at 2633375) in-process to tip.
+  **Self-halt is not trusted** — `v0.16.2` carries a divergent `v0.20.0-combined`
+  handler and would fork block 1,210,440, so every boundary is force-capped with
+  `--halt-height`. Before every start, `run.sh` also runs the **startup switch**
+  (`switch-pending-upgrade.sh`): if `data/upgrade-info.json` names a plan whose
+  slot is staged, it points cosmovisor's `current` link at that slot — see
+  "Chain upgrades" for why cosmovisor cannot do this itself at a halt.
   > The ladder tail was characterized with `v0.23.0` as the genesis binary;
-  > with `image.tag` now `v0.27.1` a full in-chart archive replay should be
+  > with `image.tag` now `v0.27.4` a full in-chart archive replay should be
   > **re-verified**. The default/snapshot/validator paths are unaffected.
 
 The archive bootstrap is idempotent/resumable via a progress marker
@@ -176,7 +183,7 @@ one in a throwaway container:
 ```sh
 # --entrypoint sh: the image entrypoint wraps sovrd, so a shell must be requested
 # explicitly. --user 0: so it can write the key into your (root-owned) host dir.
-docker run --rm --user 0 --entrypoint sh -v "$PWD:/out" ghcr.io/sovrn-tech/sovrd:v0.27.1 \
+docker run --rm --user 0 --entrypoint sh -v "$PWD:/out" ghcr.io/sovrn-tech/sovrd:v0.27.4 \
   -c 'sovrd init tmp --home /tmp/x >/dev/null 2>&1 && cp /tmp/x/config/priv_validator_key.json /out/'
 # BACK THIS UP OFFLINE NOW. Anyone with it can double-sign as you.
 ```
@@ -313,49 +320,130 @@ spec:
       size: 200Gi
 ```
 
-## ⚠️ Chain upgrades — you must update the chart before each one
+## ⚠️ Chain upgrades — stage the new binary before each height
 
-This chart does **not** auto-fetch upgrade binaries yet. Cosmovisor **halts your
-node at every governance upgrade height** and waits for the new binary. If it
-isn't staged, your node stops at that height and does not sync further — this is
-safe (no fork), but it's **stuck until you act**.
+Every SOVR `x/upgrade` halts the chain at its plan height. The chart turns that
+halt into **one automatic container restart** — but only if the plan's binary is
+staged. Two rules:
 
-So for **every** SOVR chain upgrade you must move to a chart version that includes
-it **before the upgrade height**.
+1. **Before the height**, the chart you run must carry the plan in
+   `networks.<network>.upgrades` (`{ plan: <exact Plan.Name>, tag: <image tag whose
+   binary has the handler> }`). Sovren publishes a chart version with the entry as
+   soon as a proposal passes; move to it (or add the entry to your own values)
+   before the height. The entry stages that tag's `sovrd` under
+   `cosmovisor/upgrades/<plan>`; the running binary is untouched.
+2. **`image.tag` moves to the new binary only after the height — and "after"
+   means after *your node* has committed the plan height, not after the
+   network has.** A binary that carries a *pending* plan's handler refuses to
+   run against pre-height state (`BINARY UPDATED BEFORE TRIGGER`) on every
+   restart, or forks. A node that is still catching up (state-synced or
+   restored below the height, or offline during the halt) must keep the
+   pre-height `image.tag` until `sovrd status` on *that node* shows it past
+   the height, or be re-bootstrapped from a post-height snapshot. Never
+   "upgrade early" by bumping `image.tag`.
 
-**Operators** — when Sovren announces an upgrade (plan name + height), bump to the
-published chart version that includes it, before the height:
+**What happens at the height.** The old binary halts (`UPGRADE "<plan>" NEEDED at
+height …`) after writing `data/upgrade-info.json`, and the container exits. On the
+restart `run.sh` runs `switch-pending-upgrade.sh`, which compares the `sovrd
+version` of the genesis slot (`image.tag`), the slot `current` points at, and the
+recorded plan's slot, and points cosmovisor's `current` link at the **newest**
+(ties go to genesis) — writing the recorded plan into that slot, the same two
+writes cosmovisor's own `SetCurrentUpgrade` performs. At a halt that is the
+plan's slot; cosmovisor then starts the new binary, which applies the plan and
+resumes. Expected log sequence:
+
+```
+UPGRADE "v0.28.0-security-hardening" NEEDED at height: 2819382 …
+[switch] recorded plan v0.28.0-security-hardening@2819382 into upgrades/v0.28.0-security-hardening/upgrade-info.json
+[switch] current genesis -> upgrades/v0.28.0-security-hardening: plan v0.28.0-security-hardening@2819382 is pending and upgrades/v0.28.0-security-hardening (v0.28.0) is newer than genesis (v0.27.4)
+… applying upgrade "v0.28.0-security-hardening" at height: 2819382
+```
+
+**Why the chart does the switch (cosmovisor 1.7.x caveat).** The pinned cosmovisor
+(`cosmovisor.version`, v1.7.0; v1.7.1–v1.7.3 are identical here) only switches
+after a successful `sovrd status` reporting a height at or past the plan height.
+At a real halt the app has already panicked, `status` fails, the check is false,
+and cosmovisor exits with the app's error — on restart the old binary replays
+the halt block and panics again, forever (cosmos/cosmos-sdk#26091, #22731; the
+fix, #23720, is in no released cosmovisor). The startup switch closes that gap
+and stays a harmless no-op once a fixed cosmovisor ships (bump
+`cosmovisor.version`/`downloadUrl`; `fetch.sh` re-downloads on existing volumes).
+The "newest binary wins" rule is also what makes a later `image.tag` bump take
+effect after an upgrade (`current` moves back to genesis once it is newer than
+the plan's slot) and what keeps a stale `upgrades` entry from ever rolling a node
+back. It assumes what every Cosmos SDK app does: a newer release carries the
+handlers of all earlier plans. Writing the recorded plan into the selected slot
+matters too: cosmovisor reads `current/upgrade-info.json` to learn which plan
+the running binary belongs to, and would otherwise swap to the plan's slot — even
+an older one — the moment `sovrd status` answers.
+Related knobs set by `run.sh`: `COSMOVISOR_DISABLE_RECASE=true` (slot names are the
+exact `Plan.Name`) and `UNSAFE_SKIP_BACKUP` from `cosmovisor.skipBackup`. **The
+default `true` changes nothing with cosmovisor 1.7.x**: the chart's startup switch
+drives every halt and never copies `data/`. It matters only once a fixed
+cosmovisor performs the switch itself — then `false` restores cosmovisor's
+pre-upgrade copy of `data/` (a rollback aid) at the cost of 2× disk on the PVC
+and minutes of extra downtime at the height. Validators who want that safety net
+when it becomes available should set `false` now and size the volume for it.
+
+**Operators** — when Sovren announces an upgrade (plan name + height), move to the
+chart version that includes it, before the height:
 
 ```sh
-helm upgrade sovr oci://ghcr.io/sovrn-tech/charts/sovr-node --version <new> --reuse-values
+# --reset-then-reuse-values (Helm >= 3.14): take the NEW chart's defaults (the
+# upgrades entry, image.tag) and re-apply only your own overrides. Plain
+# --reuse-values would keep the previous chart's defaults and stage nothing.
+helm upgrade sovr oci://ghcr.io/sovrn-tech/charts/sovr-node --version <new> --reset-then-reuse-values
+# or, on older Helm, pass your values file explicitly: helm upgrade ... -f my-values.yaml
 ```
 
-GitOps: bump the chart `version` in your HelmRelease / Application — it reconciles
-and cosmovisor swaps automatically at the height. A node that **already halted**
-at an upgrade just needs the new chart version applied; it resumes from the halt.
-This applies to `default` and `archive` nodes alike (the historical archive ladder
-never changes — only this forward path does).
+If you override `image.tag` or `networks.<network>.upgrades` yourself, update
+those overrides too. GitOps: bump the chart `version` in your HelmRelease /
+Application (Flux and Argo CD apply the new chart defaults under your values). The pod
+restarts once (the scripts ConfigMap checksum changes) and the slot is staged;
+nothing else happens until the height. A node that **already halted** just
+needs the chart version applied: it restarts, switches, and resumes from the
+halt. This applies to `default`, `snapshot` and `archive` nodes alike. If you
+carried a workaround for this (an `upgrades` entry of your own, a
+`UNSAFE_SKIP_BACKUP` or switch-on-restart postRenderer), drop it — the chart's
+entry is the same thing.
 
-**Maintainers** — publish a new chart version for each chain upgrade, adding the
-plan → binary mapping to `networks.<network>.upgrades` (empty by default; it holds
-*future*, post-tip upgrades only — the historical ones are baked into the archive
-`--halt-height` ladder):
+**Fresh installs after a height.** `mode=snapshot` restores a snapshot whose
+`data/upgrade-info.json` names the last applied plan; the restore keeps that file
+and the switch boots the newest staged binary for it — the plan's slot while
+`image.tag` still names the pre-height binary, genesis once it has moved past.
+`mode=default` (state-sync) has no such file to key off, so a state-synced node
+must run the current chain binary: set `image.tag` to it (this is why the
+default moves after each height, and why testnet installs today need
+`--set image.tag=v0.28.0`).
 
-```yaml
-networks:
-  mainnet:            # add to testnet too if it takes the same plan
-    upgrades:
-      - plan: v0.27.0-something   # exact on-chain Plan.Name
-        tag: v0.27.0
-```
+**Maintainers** — release cadence:
 
-The `plan` must match the on-chain `Plan.Name` exactly — cosmovisor keys on it
-(height-independent), so the same entry works across networks.
+- **Proposal passes → publish before the height**: append
+  `{ plan: <exact Plan.Name>, tag: <image tag that applies it> }` to
+  `networks.<network>.upgrades` (mainnet and/or testnet), bump `Chart.version`
+  (and `appVersion` if the binary is new), publish. The plan name is used
+  verbatim as a directory name — it must match the on-chain `Plan.Name`
+  exactly (case included).
+- **After the height**: in the next routine release move `image.tag` to the new
+  binary; the switch moves `current` back to genesis because it is now the
+  newest. Announce it as "for nodes that have crossed the height" — a lagging
+  node must hold the old tag or be re-bootstrapped (rule 2). The `upgrades` entry may stay (it is inert once `image.tag` is past
+  its tag and can never roll a node back); drop it whenever convenient —
+  existing volumes keep the slot, and a `current` left dangling by a deleted
+  slot is re-pointed at genesis.
+- **Rehearse on `test-sovr-1`** before relying on a new chart for mainnet:
+  schedule a plan, stage it through `upgrades`, and watch the pod at the height
+  for the log sequence above. Also rehearse a fresh `mode=snapshot` install from a
+  post-height snapshot (the `restore-snapshot.sh` keep path).
+- `sh helm/sovr-node/tests/scripts.test.sh` drives the switch (halt, post-height
+  tag bump, stale entry, downgrade, second upgrade, unreadable versions) and
+  re-staging offline against the rendered ConfigMap; run it with every change to
+  `templates/configmap-scripts.yaml`.
 
-> **This manual step goes away** once SOVR upgrade proposals carry a signed binary
-> download URL in `Plan.info` and the chart sets `DAEMON_ALLOW_DOWNLOAD_BINARIES=true`
-> — then cosmovisor self-fetches at the height and no chart/node update is needed.
-> That's a planned chain-side change (tracked separately).
+> **Auto-download** (`DAEMON_ALLOW_DOWNLOAD_BINARIES=true`) stays off: SOVR plans
+> carry no signed binary URL in `Plan.info`, and cosmovisor 1.7.x would not reach
+> the download at a halt anyway. If both change, flip it in `run.sh`; the startup
+> switch stays harmless.
 
 ## GitOps (Argo CD / Flux)
 
@@ -451,13 +539,14 @@ can't honor.
 **`mode=archive` (from-genesis) has NOT been run end to end inside the chart.** The
 `--halt-height` ladder itself is **proven outside the chart** — a full genesis→head
 replay completed on a standalone box, all 5 x/upgrade boundaries canonical vs
-mainnet — but a full in-chart pass hasn't run, and `image.tag` is now `v0.27.1`
+mainnet — but a full in-chart pass hasn't run, and `image.tag` is now `v0.27.4`
 (a different genesis binary than the ladder was characterized with). Validate:
 
 3. **The 8-stage `--halt-height` bootstrap ladder** (`v0.4.0@328000 … v0.20.1@1356994`)
-   → hand-off to cosmovisor (`v0.27.1` applies `v0.23.0-combined@1356994` + the later
-   upgrades, then runs to tip), and **libwasmvm-wrapper resolution across all 9 staged
-   slots** (8 bootstrap binaries + the `v0.27.1` genesis slot). Expect a ~1–2 day run.
+   → hand-off to cosmovisor (`v0.27.4` applies `v0.23.0-combined@1356994` + the later
+   upgrades, then runs to tip), and **libwasmvm-wrapper resolution across all staged
+   slots** (8 bootstrap binaries + the `v0.27.4` genesis slot + the `upgrades/*`
+   slots). Expect a ~1–2 day run.
    Note: a network-distant node can stall on CometBFT's compiled-in 128 KB/s blocksync
    minimum to the single archive peer — a from-genesis-over-WAN limitation, not a chart bug.
 4. **No liveness probe** is set by default so a multi-day sync isn't killed — decide
